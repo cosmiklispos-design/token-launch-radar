@@ -1,14 +1,18 @@
-// A working token-radar-01 entry (Node 22, standard library only).
+// A working token-radar-01 entry (Node 22, standard library only), radar-2 model.
 //
 // The program reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>), scores every
 // pre-token protocol with the model in lib/model.ts, writes the ranked board to /output/board.json, and
 // copies this repository's dashboard/ and screenshots/ to /output. Last, it writes /output/dossier.json,
 // the summary the judge reads, with the vendored make.fun library.
 //
+// Radar-2 scores a protocol from the snapshot's own figures: TVL times a category multiple derived
+// from the snapshot's tokenised peers (median market-cap-to-TVL per category), seven-day growth with
+// a harder penalty for falls, age with no token, and chain diversity. No protocol name is
+// special-cased, and the board carries every watchlist slug plus the early pre-token protocols the
+// watchlist leaves out, with strictly decreasing implied values.
+//
 // The dashboard is a static page, no framework and no network: dashboard/index.html, dashboard/app.css
-// and dashboard/app.js read /output/data.js, which this program writes from the same board. A starting
-// point, not a winner: it covers the watchlist, states the model and gives every protocol a farm plan.
-// Change the model, the page or the plan; keep the gate's shape.
+// and dashboard/app.js read /output/data.js, which this program writes from the same board.
 //
 // Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:
 //   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input ../input/snapshot.json
@@ -87,5 +91,6 @@ writeFileSync(join(out, 'dossier.json'), buildDossier(out, { text_max_bytes: TEX
 
 process.stdout.write(
   `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside)\n` +
+    `token radar: model ${radar.model_version}, ${Object.keys(radar.category_multiples).length} category multiples from the snapshot's tokenised peers, total implied value $${radar.total_implied_value_usd.toLocaleString('en-US')}\n` +
     `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (3 files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
 );
