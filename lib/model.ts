@@ -1,4 +1,4 @@
-// The token radar's model, radar-2: one snapshot of the protocol universe in, one ranked board out.
+// The token radar's model, radar-3: one snapshot of the protocol universe in, one ranked board out.
 //
 // The board covers every slug in the snapshot's watchlist (the floor, never a ceiling) and adds
 // pre-token protocols the watchlist leaves out: below the floor, and above it when they are not a
@@ -8,23 +8,45 @@
 // live-token protocols are kept apart and shown as the market's own values, never mixed into the
 // ranked board.
 //
-// Implied value follows only from the snapshot's own figures, and the category multiple is derived
-// from the snapshot itself, not chosen by hand:
+// Implied value follows only from the snapshot's own figures. Three of its pieces are derived from
+// the snapshot itself, never chosen by hand:
 //
 //   peer multiple (per category) = median(mcap_usd / tvl_usd) over the snapshot's tokenised
 //                                  protocols in that category (at least 3 peers, else the global
 //                                  median over all tokenised protocols)
 //   category multiple            = clamp(peer multiple / global median, 0.5, 2.5)
+//   category median growth       = median(change_7d) over the snapshot's pre-token protocols in
+//                                  that category (at least 3 with a 7d figure, else the global
+//                                  pre-token median)
+//   category TVL share           = tvl_usd / the category's total TVL in the snapshot
+//
+// Radar-3 adds three components on top of radar-2's base, growth, maturity and chain pieces:
+//
+//   momentum   = 1 + clamp(growth - category median growth, -30, 40) / 100 x 0.5
+//                A protocol growing faster than its own category earns a premium; one growing
+//                slower than its peers is marked down. The comparison is against the category,
+//                so a rising category does not flatter every row in it.
+//   quality    = 1 + 0.10 x min(category TVL share / 0.20, 1)
+//                A protocol that holds a real share of its category's TVL is a category leader,
+//                not a rounding error: up to a 10% premium, reached at a 20% category share.
+//   spike      = 0.85 when a protocol younger than 90 days grew more than 60% in a week,
+//                0.90 when one younger than 180 days grew more than 100% in a week or holds
+//                more than ten times its category's median TVL, else 1.00
+//                A very young protocol with a huge one-week spike is the shape of a
+//                mis-measurement (a new listing, a re-staked pool, a data error) more often than
+//                the shape of durable value, so the model discounts it until it has a track record.
+//
 //   base                         = tvl_usd x BASE_MULTIPLE x category multiple
 //   growth                       = clamp(change_7d, -60, 120) per cent
 //   growthMult                   = 1 + (growth / 100) x GROWTH_WEIGHT        (growth >= 0)
 //                                = 1 + (growth / 100) x GROWTH_DOWN_WEIGHT   (growth < 0: falls hurt more)
 //   maturity                     = 0.65 + min(age_days, 1460) / 1460 x 0.35  (age unknown: 365 days)
 //   chainMult                    = 1 + 0.03 x min(chains - 1, 5), at most 1.15
-//   implied                      = max(1, round(base x growthMult x maturity x chainMult))
+//   implied                      = max(1, round(base x growthMult x maturity x chainMult
+//                                        x momentum x quality x spike))
 //
 // No protocol name is ever special-cased: the same function scores every row, and the category
-// multiples are recomputed from whatever snapshot the program reads.
+// multiples, median growths and TVL shares are recomputed from whatever snapshot the program reads.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -65,6 +87,19 @@ export interface ModelConstants {
   category_floor: number;
   category_cap: number;
   category_min_peers: number;
+  momentum_weight: number;
+  momentum_floor: number;
+  momentum_cap: number;
+  quality_weight: number;
+  quality_share_cap: number;
+  spike_young_days: number;
+  spike_growth_pct: number;
+  spike_penalty: number;
+  spike_old_days: number;
+  spike_old_growth_pct: number;
+  spike_old_penalty: number;
+  spike_tvl_ratio: number;
+  spike_tvl_penalty: number;
 }
 
 export const MODEL: ModelConstants = {
@@ -82,10 +117,23 @@ export const MODEL: ModelConstants = {
   category_floor: 0.5,
   category_cap: 2.5,
   category_min_peers: 3,
+  momentum_weight: 0.5,
+  momentum_floor: -30,
+  momentum_cap: 40,
+  quality_weight: 0.1,
+  quality_share_cap: 0.2,
+  spike_young_days: 90,
+  spike_growth_pct: 60,
+  spike_penalty: 0.85,
+  spike_old_days: 180,
+  spike_old_growth_pct: 100,
+  spike_old_penalty: 0.9,
+  spike_tvl_ratio: 10,
+  spike_tvl_penalty: 0.9,
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** How many pre-token protocols outside the watchlist the early radar carries, by TVL. */
 export const EARLY_ROWS = 220;
@@ -124,6 +172,11 @@ export interface BoardRow {
     growth_multiplier: number;
     maturity_multiplier: number;
     chain_multiplier: number;
+    momentum_multiplier: number;
+    quality_multiplier: number;
+    spike_penalty: number;
+    category_median_growth_pct: number;
+    category_tvl_share: number;
     age_days: number | null;
   };
   farm_steps: string[];
@@ -147,6 +200,11 @@ export interface RadarRow {
   growth_multiplier: number;
   maturity_multiplier: number;
   chain_multiplier: number;
+  momentum_multiplier: number;
+  quality_multiplier: number;
+  spike_penalty: number;
+  category_median_growth_pct: number;
+  category_tvl_share: number;
 }
 
 /** A live-token protocol: it already trades, so the board shows the market's own value, not a model's. */
@@ -174,6 +232,7 @@ export interface RadarData {
   live_size: number;
   total_implied_value_usd: number;
   category_multiples: Record<string, number>;
+  category_median_growth: Record<string, number>;
   rows: RadarRow[];
   live: LiveRow[];
 }
@@ -239,13 +298,106 @@ function multipleFor(category: string | null, multiples: Record<string, number>)
   return multiples[category ?? 'Other'] ?? 1;
 }
 
-/** The three multipliers and the implied value one protocol gets under `model`. */
+/** One category's own figures: the pre-token median 7d growth, the total TVL and the median TVL. */
+export interface CategoryStats {
+  median_growth_pct: number;
+  total_tvl_usd: number;
+  median_tvl_usd: number;
+}
+
+/**
+ * The per-category statistics radar-3's new components read: for each category, the median 7d
+ * growth of its pre-token protocols (the momentum benchmark), the category's total TVL and its
+ * median protocol TVL (the quality and spike benchmarks). Categories with too few pre-token growth
+ * readings fall back to the global pre-token median growth, so a thin category is never judged
+ * against a single outlier. Nothing here names a protocol.
+ */
+export function categoryStats(snapshot: Snapshot, model: ModelConstants = MODEL): { stats: Record<string, CategoryStats>; globalMedianGrowth: number } {
+  const preGrowth = snapshot.protocols
+    .filter((p) => isPreToken(p) && p.change_7d !== null)
+    .map((p) => p.change_7d!);
+  const globalMedianGrowth = preGrowth.length > 0 ? median(preGrowth) : 0;
+  const byCategory = new Map<string, { growth: number[]; tvls: number[]; total: number }>();
+  for (const p of snapshot.protocols) {
+    const key = p.category ?? 'Other';
+    const bucket = byCategory.get(key) ?? { growth: [], tvls: [], total: 0 };
+    bucket.tvls.push(p.tvl_usd);
+    bucket.total += p.tvl_usd;
+    if (isPreToken(p) && p.change_7d !== null) bucket.growth.push(p.change_7d);
+    byCategory.set(key, bucket);
+  }
+  const stats: Record<string, CategoryStats> = {};
+  for (const [key, bucket] of byCategory) {
+    const catMedian = bucket.growth.length >= model.category_min_peers ? median(bucket.growth) : globalMedianGrowth;
+    stats[key] = {
+      median_growth_pct: Math.round(catMedian * 100) / 100,
+      total_tvl_usd: bucket.total,
+      median_tvl_usd: bucket.tvls.length > 0 ? median(bucket.tvls) : 0,
+    };
+  }
+  return { stats, globalMedianGrowth };
+}
+
+/** The stats one protocol gets, from the derived table (unknown category: the global median growth, no share). */
+function statsFor(category: string | null, stats: Record<string, CategoryStats>, globalMedianGrowth: number): CategoryStats {
+  return stats[category ?? 'Other'] ?? { median_growth_pct: globalMedianGrowth, total_tvl_usd: 0, median_tvl_usd: 0 };
+}
+
+/**
+ * The momentum multiplier: how far this protocol's clamped 7d growth sits above or below its own
+ * category's pre-token median growth, clamped to the model's floor and cap, weighted by
+ * momentum_weight. A protocol that merely keeps up with its category earns 1.00.
+ */
+export function momentumMultiplier(growthPct: number, categoryMedianGrowthPct: number, model: ModelConstants = MODEL): number {
+  const rel = Math.min(model.momentum_cap, Math.max(model.momentum_floor, growthPct - categoryMedianGrowthPct));
+  return Math.round((1 + (rel / 100) * model.momentum_weight) * 1e4) / 1e4;
+}
+
+/**
+ * The quality multiplier: a protocol's share of its category's total TVL, scaled so a 20% share
+ * (or more) earns the full quality_weight premium and a negligible share earns nothing. A category
+ * with no TVL total gives no premium.
+ */
+export function qualityMultiplier(tvlUsd: number, categoryTotalTvlUsd: number, model: ModelConstants = MODEL): number {
+  if (categoryTotalTvlUsd <= 0) return 1;
+  const share = tvlUsd / categoryTotalTvlUsd;
+  return Math.round((1 + model.quality_weight * Math.min(share / model.quality_share_cap, 1)) * 1e4) / 1e4;
+}
+
+/**
+ * The spike penalty: a very young protocol with a huge one-week move is discounted as a possible
+ * mis-measurement until it has a track record. Unknown age is never penalised — the model cannot
+ * tell a young spike from an old one, so it assumes the latter.
+ */
+export function spikePenalty(age: number | null, growthPct: number, tvlUsd: number, categoryMedianTvlUsd: number, model: ModelConstants = MODEL): number {
+  if (age === null) return 1;
+  if (age < model.spike_young_days && growthPct > model.spike_growth_pct) return model.spike_penalty;
+  if (age < model.spike_old_days && growthPct > model.spike_old_growth_pct) return model.spike_old_penalty;
+  if (age < model.spike_old_days && categoryMedianTvlUsd > 0 && tvlUsd > model.spike_tvl_ratio * categoryMedianTvlUsd) return model.spike_tvl_penalty;
+  return 1;
+}
+
+/** The five multipliers and the implied value one protocol gets under `model`. */
 export function impliedValue(
   protocol: SnapshotProtocol,
   asOf: string,
   model: ModelConstants,
   categoryMultiple: number,
-): { implied: number; base: number; growthPct: number; growthMult: number; maturityMult: number; chainMult: number; age: number | null } {
+  stats: CategoryStats,
+): {
+  implied: number;
+  base: number;
+  growthPct: number;
+  growthMult: number;
+  maturityMult: number;
+  chainMult: number;
+  momentumMult: number;
+  qualityMult: number;
+  spike: number;
+  categoryMedianGrowthPct: number;
+  categoryTvlShare: number;
+  age: number | null;
+} {
   const age = ageDays(asOf, protocol.listed_at);
   const rawGrowth = finite(protocol.change_7d, 0);
   const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
@@ -254,9 +406,26 @@ export function impliedValue(
   const ageForModel = age ?? model.unknown_age_days;
   const maturityMult = model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
   const chainMult = Math.min(model.chain_cap, 1 + model.chain_step * Math.max(0, Math.min(protocol.chains.length - 1, 5)));
+  const momentumMult = momentumMultiplier(growthPct, stats.median_growth_pct, model);
+  const qualityMult = qualityMultiplier(protocol.tvl_usd, stats.total_tvl_usd, model);
+  const spike = spikePenalty(age, growthPct, protocol.tvl_usd, stats.median_tvl_usd, model);
+  const categoryTvlShare = stats.total_tvl_usd > 0 ? protocol.tvl_usd / stats.total_tvl_usd : 0;
   const base = protocol.tvl_usd * model.base_multiple * categoryMultiple;
-  const implied = Math.max(1, Math.round(base * growthMult * maturityMult * chainMult));
-  return { implied, base: Math.round(base), growthPct, growthMult, maturityMult, chainMult, age };
+  const implied = Math.max(1, Math.round(base * growthMult * maturityMult * chainMult * momentumMult * qualityMult * spike));
+  return {
+    implied,
+    base: Math.round(base),
+    growthPct,
+    growthMult,
+    maturityMult,
+    chainMult,
+    momentumMult,
+    qualityMult,
+    spike,
+    categoryMedianGrowthPct: stats.median_growth_pct,
+    categoryTvlShare,
+    age,
+  };
 }
 
 /** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
@@ -306,6 +475,7 @@ export interface BoardSummary {
 /** The protocols the board ranks, strongest first, with ranks 1..n and strictly decreasing values. */
 export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): BoardRow[] {
   const { multiples } = categoryMultiples(snapshot, model);
+  const { stats, globalMedianGrowth } = categoryStats(snapshot, model);
   const index = bySlug(snapshot.protocols);
   const chosen = new Map<string, SnapshotProtocol>();
   // The watchlist is the floor: every slug, even one the snapshot no longer carries (it cannot, but the
@@ -327,7 +497,8 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
 
   const scored = [...chosen.values()].map((p) => {
     const catMult = multipleFor(p.category, multiples);
-    const v = impliedValue(p, snapshot.as_of, model, catMult);
+    const catStats = statsFor(p.category, stats, globalMedianGrowth);
+    const v = impliedValue(p, snapshot.as_of, model, catMult, catStats);
     return { p, catMult, ...v };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
@@ -361,6 +532,11 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
         growth_multiplier: round4(s.growthMult),
         maturity_multiplier: round4(s.maturityMult),
         chain_multiplier: round4(s.chainMult),
+        momentum_multiplier: round4(s.momentumMult),
+        quality_multiplier: round4(s.qualityMult),
+        spike_penalty: s.spike,
+        category_median_growth_pct: s.categoryMedianGrowthPct,
+        category_tvl_share: round4(s.categoryTvlShare),
         age_days: s.age,
       },
       farm_steps: farmSteps(s.p, s.age).map(stepText),
@@ -443,7 +619,6 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   const hold = holdDaysFor(age);
   const action = actionFor(p, capital, chain);
   const weekly = weeklyActionFor(p, chain);
-  const secondChain = p.chains.length > 1 ? ` and ${p.chains[1]}` : '';
   return [
     {
       text: `Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.`,
@@ -461,7 +636,7 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       time: '10 minutes a week',
     },
     {
-      text: `Hold the position for at least ${hold} days${secondChain ? `, and repeat the same steps on${secondChain} if the protocol runs there` : ''}, so the activity is counted in more than one snapshot.`,
+      text: `Hold the position for at least ${hold} days${p.chains.length > 1 ? `, and repeat the same steps on ${p.chains[1]} if the protocol runs there` : ''}, so the activity is counted in more than one snapshot.`,
       cost: `the $${capital} stays in the position`,
       time: `${hold} days`,
     },
@@ -514,6 +689,11 @@ export function radarRow(row: BoardRow): RadarRow {
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
     chain_multiplier: row.model.chain_multiplier,
+    momentum_multiplier: row.model.momentum_multiplier,
+    quality_multiplier: row.model.quality_multiplier,
+    spike_penalty: row.model.spike_penalty,
+    category_median_growth_pct: row.model.category_median_growth_pct,
+    category_tvl_share: row.model.category_tvl_share,
   };
 }
 
@@ -523,6 +703,9 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
   const live = liveRows(snapshot);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
   const { multiples } = categoryMultiples(snapshot, model);
+  const { stats } = categoryStats(snapshot, model);
+  const medianGrowth: Record<string, number> = {};
+  for (const [key, s] of Object.entries(stats)) medianGrowth[key] = s.median_growth_pct;
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
@@ -536,6 +719,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     live_size: live.length,
     total_implied_value_usd: board.reduce((sum, r) => sum + r.implied_value_usd, 0),
     category_multiples: multiples,
+    category_median_growth: medianGrowth,
     rows: board.map(radarRow),
     live,
   };
